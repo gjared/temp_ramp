@@ -10,7 +10,9 @@
 
 // Load modules
 var fs = require('fs');
-var lineReader = require('line-reader');
+var split = require('split');
+var Transform = require("stream").Transform;
+var util = require("util");
 
 // Check args
 if (process.argv.length < 3) {
@@ -18,132 +20,240 @@ if (process.argv.length < 3) {
 	process.exit();
 }
 
-// Rate to drop temperature
-var step = 3;
-var steptime = 10;
 
-// Now open and walk file
-var preamble = true;
-var pretemp = null;
-var temp = null;
-var elapsed = 0.0;
-var currstep = 0;
-var currtemp = null;
+// Stream processor
+util.inherits(TempTransform, Transform);
+function TempTransform(options) {
+	Transform.call(this, options);
 
-// Stateful stuff
-var x = 0.0, y = 0.0, z = 0.0, e = 0.0, f = 600.0;
+	// Main settings
+	this.step = 3;
+	this.steptime = 10;
 
-// Output stuff, synchronous
-var ofd = fs.openSync(process.argv[2] + ".tempmod", "w");
+	// Finished mode, passes through rest
+	this.ramp_complete = false;
 
-// Helper function to write
-var output = function(str) {
-	var buf = new Buffer(str);
-	fs.writeSync(ofd, buf, 0, buf.length);
+	// Temp tracking
+	this.preamble = true;
+	this.pretemp = null;
+	this.temp = null;
+	this.elapsed = 0.0;
+	this.currstep = -1;
+	this.currtemp = null;
+
+	// Machine position and extruder state
+	this.mstate = {
+		X: 0.0,
+		Y: 0.0,
+		Z: 0.0,
+		E: 0.0,
+		F: 0.0
+	};
+
+	// Buffer output here, important for copy performance
+	// in some scenarios, i.e. network drives
+	this.bufcap = Math.pow(2, 16);
+	this.outbuf = new Buffer(this.bufcap);
+	this.obsize = 0;
+
 }
 
-// Process
-lineReader.eachLine(process.argv[2], function(line, last) {
+// Helper to buffer output, or send null to flush
+TempTransform.prototype.buffer_output = function(buf) {
 
-	// Capture temp lines and specially handle here
-	if (m = line.match(/^M104 (T\d )?S(\d+)/)) {
+	// See if there is enough room, if not, flush output first
+	if (buf == null || (this.outbuf.length < this.obsize + buf.length + 2)) {
+		this.push(this.outbuf.slice(0, this.obsize));
 
-		// Check here
-		if (preamble) {
-			if (pretemp == null) pretemp = parseInt(m[2]);
-			if (currtemp == null) currtemp = pretemp;
+		// Can't reuse buffer immediately because still going through
+		// output path.  For now just allocate new ones, can do something
+		// smarter if needed.
+		this.outbuf = new Buffer(this.bufcap);
+		this.obsize = 0;
+	}
+
+	// Now copy it in
+	if (buf != null) {		
+		buf.copy(this.outbuf, this.obsize);
+		this.outbuf.writeUInt8(13, this.obsize + buf.length);
+		this.outbuf.writeUInt8(10, this.obsize + buf.length + 1);
+		this.obsize += buf.length + 2;
+	}
+}
+
+
+// Helper to iterate over args as arg type, val pairs
+TempTransform.prototype.each_gcode_arg = function(parts, cb) {
+	for (var i = 1; i < parts.length; i++) {
+		var s = parts[i];
+		cb(s.substr(0,1), s.substr(1));
+	}
+}
+
+
+// Helper to extract matching arg
+TempTransform.prototype.get_gcode_arg = function(parts, argname) {
+	for (var i = 1; i < parts.length; i++) {
+		var s = parts[i];
+		if (s.substr(0, 1) == argname) return s.substr(1);		
+	}
+	return null;
+}
+
+// Helper ramp function, for now assumes we don't
+// have such long motion intervals that we skip
+// temporal steps
+TempTransform.prototype.ramp_tick = function() {
+
+	// Check if we're ready to start the ramp down
+	if (this.temp == null) return;
+
+	// Now quantize to check our step	
+	var nstep = Math.floor(this.elapsed/this.steptime);
+	//console.log(this.elapsed, nstep, this.currstep);
+	if (nstep <= this.currstep) return;
+
+	// See where the step takes us
+	var target = this.currtemp - this.step;
+	if (target < this.temp) target = this.temp;
+
+	// Take a step now and continue on
+	this.buffer_output(new Buffer("M104 S" + target + " T1", "ascii"));
+	this.currtemp = target;		
+	this.currstep = nstep;
+
+	// Check if done
+	if (this.currtemp == this.temp) {
+		console.log("Thermal ramp complete!", this.currtemp, this.temp);
+		this.ramp_complete = true;
+	}
+}
+
+
+// Do fine-grained line processing
+TempTransform.prototype.process_line = function(origline) {
+
+	// Just copy straight if done
+	if (this.ramp_complete) {
+		this.buffer_output(origline);
+		return;
+	}
+
+	// Trim off comments and end newline
+	var line = origline;
+	for (var i = 0; i < line.length; i++) {
+		if (line[i] == 40 || line[i] == 59 || line[i] == 10) {
+			line = line.slice(0, i);
+			break;
+		} 
+	}
+
+	// Extract first command here
+	var parts = line.toString('ascii').split(" ");	
+
+	// Now handle various cases here
+	if (parts[0] == 'G1') {
+
+		// Deltas here
+		var deltas = {};
+
+		// Compute deltas here while updating
+		var self = this;
+		this.each_gcode_arg(parts, function(arg, val) {
+
+			var oldval = self.mstate[arg];
+			var newval = parseFloat(val);
+			deltas[arg] = newval - oldval;
+			self.mstate[arg] = newval;
+
+		});
+		
+		// Now compute motion delta
+		var dsq = (deltas.X == null ? 0.0 : deltas.X * deltas.X) +
+			(deltas.Y == null ? 0.0 : deltas.Y * deltas.Y) +
+			(deltas.Z == null ? 0.0 : deltas.Z * deltas.Z);
+
+		// Compute speed and time
+		var dt = Math.sqrt(dsq) / (this.mstate.F / 60.0);		
+
+		// Now check if we should increment elapsed
+		if (this.temp != null) this.elapsed += dt;
+
+	} else if (parts[0] == 'M104') {
+
+		// Extract temp here
+		var t = parseInt(this.get_gcode_arg(parts, "S"));
+
+		// Temp setting, record as needed
+		if (this.preamble) {
+
+			// Store first layer temp
+			if (this.pretemp == null) {
+				this.pretemp = t;
+				this.currtemp = t;
+				console.log("First layer temp:", t);
+			}
+
 		} else {
-			if (temp == null) {
-				temp = parseInt(m[2]);
 
-				// Step down if we need to
-				if (currtemp - step > temp) {
-					currtemp -= step;	
-				} else {
-					currtemp = temp;
-				}				
+			// Store temp and start ramp
+			if (this.temp == null) {
+				this.temp = t;
+				console.log("Normal temp:", t);
 
-				// Special case, take first step down and
-				// do not copy the temp here
-				output("M104 S" + currtemp + " T1\n");
+				// Do a tick here and skip the copy out
+				this.ramp_tick();				
 				return;
-
 			}
 		}
 
+
+	} else if (parts[0] == 'M108') {
+
+		// Tool chance just helps us differentiate
+		// M104s that come at start with the change
+		// after first layer
+		this.preamble = false;
+
 	}
 
-	// Copy over line here	
-	output(line + "\n");
+	// Log processed lines
+	//console.log(parts);
 
-	// Capture move lines 
-	if (m = line.match(/^G1( X[^\s]+)?( Y[^\s]+)?( Z[^\s]+)?( E[^\s]+)?( F[^\s]+)?/)) {
+	// Copy line here
+	this.buffer_output(origline);
 
-		// Parse as data here
-		var nx, ny, nz, ne, nf;
-		nx = m[1] != null ? parseFloat(m[1].substr(2)) : x;
-		ny = m[2] != null ? parseFloat(m[2].substr(2)) : y;
-		nz = m[3] != null ? parseFloat(m[3].substr(2)) : z;
-		ne = m[4] != null ? parseFloat(m[4].substr(2)) : e;
-		nf = m[5] != null ? parseFloat(m[5].substr(2)) : f;
+	// Do a ramp tick now
+	this.ramp_tick();
 
-		// Compute move distance
-		var dx = nx - x, dy = ny - y, dz = nz - z;
-		var delta = Math.sqrt(dx * dx + dy * dy + dz * dz);
+}
 
-		// Compute move time in seconds
-		var dt = delta / (nf / 60.0);
 
-		// Start counting and ticking here once we have a valid
-		// target temp
-		if (temp != null && currtemp != temp) {
+// Main transform logic invoked on each line
+TempTransform.prototype._transform = function (line, encoding, processed) {
 
-			// Increase time
-			elapsed += dt;
+	// Process each line here	
+	this.process_line(line);
+    processed();
 
-			// Check quantizing, take a temp step if needed
-			var sidx = Math.floor(elapsed/steptime);
-			if (sidx > currstep) {
+}
 
-				// Take the step
-				if (currtemp - step > temp) {
-					currtemp -= step;	
-				} else {
-					currtemp = temp;
-				}		
+// Flush last block at end
+TempTransform.prototype._flush = function (cb) {
 
-				// Increment here
-				currstep = sidx;
+	this.process_line(null);
+	cb();
 
-				// Output the string
-				output("M104 S" + currtemp + " T1\n");
-			}
+}
 
-			
-		}
 
-		// Update pos now
-		x = nx;
-		y = ny;
-		z = nz;
-		e = ne;
-		f = nf;		
-	}
+// Open stream and outstream
+var opts = { highWaterMark: Math.pow(2, 16) };
+var istream = fs.createReadStream(process.argv[2], opts);
+var ostream = fs.createWriteStream(process.argv[2] + ".tempmod", opts);
 
-	// Look for start of print
-	if (line.match(/^M108/)) {
-		preamble = false;		
-	}
-
-	// All done
-	if (last) {
-		console.log("Finished!");
-		fs.closeSync(ofd);
-
-		// Now overwrite the file!
-		fs.renameSync(process.argv[2] + ".tempmod", process.argv[2]);
-	}
-
-});
+// Open infile and outfile
+//istream.pipe(new TempTransform()).pipe(ostream);
+istream.pipe(split()).pipe(new TempTransform()).pipe(ostream);
 
 
