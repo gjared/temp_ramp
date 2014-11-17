@@ -254,6 +254,10 @@ var ostream = fs.createWriteStream(process.argv[2] + ".tempmod", opts);
 
 // Open infile and outfile
 //istream.pipe(new TempTransform()).pipe(ostream);
-istream.pipe(split()).pipe(new TempTransform()).pipe(ostream);
+var r = istream.pipe(split()).pipe(new TempTransform()).pipe(ostream);
 
-
+// Bind a finisher to copy it back into place
+r.on('finish', function(){
+	console.log("Finished!");
+	fs.renameSync(process.argv[2] + ".tempmod", process.argv[2]);
+});
